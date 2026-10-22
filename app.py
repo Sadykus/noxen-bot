@@ -1,66 +1,55 @@
 """
-Noxen Board — MVP backend
-=========================
-One process, two jobs:
-  1. A real Telegram bot (python-telegram-bot) that receives messages
-     and updates the "board state".
-  2. A tiny Flask web server that serves:
-       GET /            -> a live flip-board display page (the "device")
-       GET /board       -> current board state as JSON (polled by the page)
+Noxen Frame — backend
+=====================
+Один процесс, две задачи:
+  1. Telegram-бот: личный кабинет каждого пользователя (город, Instagram, фразы, устройства)
+     и старое табло (любое текстовое сообщение → на табло).
+  2. Flask-сервер:
+       GET /s/<token>.bmp  -> экран сна 480x800 для ридера (свой у каждого устройства)
+       GET /s/<token>.png  -> то же в PNG, посмотреть в браузере
+       GET /               -> живое табло
+       GET /board          -> состояние табло JSON
 
-This is intentionally simple — a single global state, no database —
-so it's easy to deploy and easy to understand. Good enough to prove
-the whole pipeline works end to end: Telegram message -> board updates
-on screen within a few seconds.
-
-Once this is proven, the next step is: real device via HTTP instead
-of this HTML page, and a proper database instead of a global variable.
+Переменные окружения:
+  BOT_TOKEN   — токен бота (обязательно)
+  PUBLIC_URL  — внешний адрес сервиса, например https://noxen.up.railway.app (для ссылок в боте)
+  DATA_DIR    — папка для базы, на Railway — подключённый Volume (/data)
 """
 
+import asyncio
 import io
 import os
-import json
 import threading
-import asyncio
 import time
 from datetime import datetime
 
-from flask import Flask, jsonify, Response
-
-import quotes as Q
-import screen
+from flask import Flask, Response, abort, jsonify
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-# ─────────────────────────────────────────────────────────────────
-# Config — the bot token comes from an environment variable.
-# NEVER hardcode it in the file — set it in Railway's dashboard instead.
-# ─────────────────────────────────────────────────────────────────
+import db
+import screen
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 PORT = int(os.environ.get("PORT", 8080))
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/") or (
+    "https://" + os.environ["RAILWAY_PUBLIC_DOMAIN"] if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else "")
 
 if not BOT_TOKEN:
-    raise RuntimeError(
-        "BOT_TOKEN environment variable is not set. "
-        "Add it in Railway → your project → Variables."
-    )
+    raise RuntimeError("BOT_TOKEN environment variable is not set. Add it in Railway → Variables.")
+
+db.init()
 
 # ─────────────────────────────────────────────────────────────────
-# Shared state — the current text on the "board".
-# A lock keeps it safe if the bot and the web server touch it
-# at the same time.
+# Табло (как было)
 # ─────────────────────────────────────────────────────────────────
 _state_lock = threading.Lock()
-board_state = {
-    "text": "NOXEN BOARD",
-    "sender": "System",
-    "updated_at": datetime.utcnow().isoformat(),
-}
+board_state = {"text": "NOXEN BOARD", "sender": "System", "updated_at": datetime.utcnow().isoformat()}
 
 
 def set_board_text(text: str, sender: str = "Telegram"):
     with _state_lock:
-        board_state["text"] = text[:200]  # sanity limit
+        board_state["text"] = text[:200]
         board_state["sender"] = sender
         board_state["updated_at"] = datetime.utcnow().isoformat()
 
@@ -71,146 +60,214 @@ def get_board_state():
 
 
 # ─────────────────────────────────────────────────────────────────
-# Telegram bot handlers
+# Экран сна: данные кешируются (погода по городу, курсы общие) на 30 минут
 # ─────────────────────────────────────────────────────────────────
+_cache = {}
+_cache_lock = threading.Lock()
+TTL = 1800
+
+
+def _cached(key, fn):
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < TTL:
+            return hit[1]
+    val = fn()
+    with _cache_lock:
+        _cache[key] = (time.time(), val)
+    return val
+
+
+def render_for(user, fmt="BMP") -> bytes:
+    today, monday = screen.week_bounds()
+    lat, lon = round(user["lat"], 2), round(user["lon"], 2)
+    wx = _cached(("wx", lat, lon, monday), lambda: screen.weather_for(lat, lon))
+    mk = _cached(("market", today), screen.market)
+    data = dict(today=today, monday=monday, wx=wx, city=user["city"], **mk)
+    text, author = db.current_quote(user)
+    img = screen.render(data, quote=text, author=author, instagram=user["instagram"])
+    buf = io.BytesIO()
+    img.save(buf, fmt)
+    return buf.getvalue()
+
+
+def screen_url(token, ext="bmp"):
+    return f"{PUBLIC_URL}/s/{token}.{ext}" if PUBLIC_URL else f"/s/{token}.{ext}"
+
+
+# ─────────────────────────────────────────────────────────────────
+# Telegram
+# ─────────────────────────────────────────────────────────────────
+HELP = (
+    "Экран сна ридера:\n"
+    "/screen — как выглядит экран сейчас\n"
+    "/quotes — список фраз\n"
+    "/quote N — поставить фразу №N\n"
+    "/addquote Текст — Автор — добавить свою\n"
+    "/delquote N — удалить фразу №N\n"
+    "/daily — менять фразу каждый день\n"
+    "/city Алматы — город для погоды\n"
+    "/instagram @ник — подпись внизу (/instagram - убрать)\n"
+    "/devices — мои ридеры и их ссылки\n"
+    "/newdevice — добавить ещё один ридер\n\n"
+    "Табло:\n"
+    "любой текст — на табло, /clear — очистить, /status — что на табло"
+)
+
+
+def _user(update: Update):
+    u = update.effective_user
+    user, _ = db.get_or_create_user(u.id, u.first_name or "")
+    return user
+
+
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    user, created = db.get_or_create_user(u.id, u.first_name or "")
+    dev = db.list_devices(u.id)[0]
+    hello = "Привет! Я создал тебе кабинет Noxen Frame 🖤" if created else "С возвращением 🖤"
     await update.message.reply_text(
-        "Привет! Я Noxen Bot 🖤\n\n"
-        "Напиши мне что угодно — сообщение появится на виртуальном табло.\n\n"
-        "Команды табло:\n"
-        "/clear — очистить табло\n"
-        "/status — текущее состояние табло\n\n"
-        "Экран сна ридера:\n"
-        "/quotes — список фраз\n"
-        "/quote N — поставить фразу №N\n"
-        "/addquote Текст — Автор — добавить свою\n"
-        "/delquote N — удалить фразу №N\n"
-        "/daily — менять фразу каждый день\n"
-        "/screen — показать, как выглядит экран сейчас"
-    )
+        f"{hello}\n\nГород: {user['city']}\nСсылка экрана для ридера:\n{screen_url(dev['token'])}\n\n{HELP}")
+
+
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP)
+
+
+def _format_quotes(user):
+    qs = db.list_quotes(user["tg_id"])
+    daily = user["quote_mode"] == "daily"
+    lines = []
+    for i, q in enumerate(qs):
+        mark = "▶️" if not daily and i == min(user["quote_pos"], len(qs) - 1) else f"{i + 1}."
+        author = f" — {q['author']}" if q["author"] else ""
+        lines.append(f"{mark} {q['text']}{author}")
+    mode = "каждый день новая" if daily else "фиксированная"
+    return "\n\n".join(lines) + f"\n\nРежим: {mode}"
+
+
+async def quotes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_format_quotes(_user(update)))
+
+
+async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    qs = db.list_quotes(user["tg_id"])
+    try:
+        n = int(context.args[0])
+        assert 1 <= n <= len(qs)
+    except (IndexError, ValueError, AssertionError):
+        return await update.message.reply_text(f"Напиши номер от 1 до {len(qs)}, например: /quote 2")
+    db.update_user(user["tg_id"], quote_pos=n - 1, quote_mode="fixed")
+    await update.message.reply_text(f"✓ На экране будет:\n«{qs[n - 1]['text']}»\nОбновится при следующем пробуждении ридера.")
+
+
+async def addquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    raw = update.message.text.partition(" ")[2].strip()
+    if not raw:
+        return await update.message.reply_text("Формат: /addquote Текст фразы — Автор")
+    text, author = db.parse_new(raw)
+    n = db.add_quote(user["tg_id"], text[:220], author[:80])
+    await update.message.reply_text(f"✓ Добавлено под №{n}. Поставить на экран: /quote {n}")
+
+
+async def delquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    try:
+        ok = db.delete_quote(user["tg_id"], int(context.args[0]) - 1)
+    except (IndexError, ValueError):
+        ok = False
+    if not ok:
+        return await update.message.reply_text("Формат: /delquote N (последнюю фразу удалить нельзя)")
+    await update.message.reply_text("🗑 Удалено.\n\n" + _format_quotes(db.get_user(user["tg_id"])))
+
+
+async def daily_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    db.update_user(user["tg_id"], quote_mode="daily")
+    await update.message.reply_text("✓ Теперь фраза меняется каждый день по списку. Вернуть одну: /quote N")
+
+
+async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    name = " ".join(context.args).strip()
+    if not name:
+        return await update.message.reply_text(f"Сейчас: {user['city']}. Сменить: /city Алматы")
+    try:
+        found = await asyncio.to_thread(screen.geocode, name)
+    except Exception:
+        found = None
+    if not found:
+        return await update.message.reply_text("Не нашёл такой город, попробуй написать иначе.")
+    lat, lon, city = found
+    db.update_user(user["tg_id"], city=city, lat=lat, lon=lon)
+    await update.message.reply_text(f"✓ Погода теперь для: {city}")
+
+
+async def instagram_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    raw = " ".join(context.args).strip()
+    if not raw:
+        cur = user["instagram"] or "не указан"
+        return await update.message.reply_text(f"Сейчас: {cur}. Сменить: /instagram @ник, убрать: /instagram -")
+    handle = "" if raw == "-" else "@" + raw.lstrip("@")[:30]
+    db.update_user(user["tg_id"], instagram=handle)
+    await update.message.reply_text(f"✓ Подпись внизу: {handle or 'убрана'}")
+
+
+async def devices_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    lines = []
+    for d in db.list_devices(user["tg_id"]):
+        seen = d["last_seen"][:16].replace("T", " ") if d["last_seen"] else "ещё не подключался"
+        lines.append(f"📟 {d['name']}\n{screen_url(d['token'])}\nПоследний раз: {seen}")
+    await update.message.reply_text("\n\n".join(lines) + "\n\nДобавить ещё: /newdevice")
+
+
+async def newdevice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    token = db.add_device(user["tg_id"])
+    await update.message.reply_text(f"✓ Новый ридер добавлен. Его ссылка:\n{screen_url(token)}")
+
+
+async def screen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = _user(update)
+    await update.message.reply_text("Рисую экран…")
+    png = await asyncio.to_thread(render_for, user, "PNG")
+    await update.message.reply_photo(png, caption="Так сейчас выглядит экран сна")
 
 
 async def clear_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sender = update.effective_user.first_name or "Telegram"
-    set_board_text(" ", sender)
+    set_board_text(" ", update.effective_user.first_name or "Telegram")
     await update.message.reply_text("🗑 Табло очищено")
 
 
 async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_board_state()
     await update.message.reply_text(
-        f"📋 Текущее сообщение: «{s['text']}»\n"
-        f"От: {s['sender']}\n"
-        f"Обновлено: {s['updated_at']} UTC"
-    )
+        f"📋 Текущее сообщение: «{s['text']}»\nОт: {s['sender']}\nОбновлено: {s['updated_at']} UTC")
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    sender = update.effective_user.first_name or "Telegram"
-    set_board_text(text, sender)
+    set_board_text(text, update.effective_user.first_name or "Telegram")
     await update.message.reply_text(f"✓ Отправлено на табло:\n«{text}»")
 
 
-# ── Фразы для экрана сна ──────────────────────────────────────────
-OWNER_ID = os.environ.get("OWNER_ID")  # если задан — менять фразы может только владелец
-
-
-def _allowed(update: Update) -> bool:
-    return not OWNER_ID or str(update.effective_user.id) == OWNER_ID
-
-
-def _format_list(data):
-    lines = []
-    for i, q in enumerate(data["quotes"], 1):
-        mark = "▶️" if data.get("mode") != "daily" and i - 1 == data.get("current", 0) else f"{i}."
-        author = f" — {q['author']}" if q.get("author") else ""
-        lines.append(f"{mark} {q['text']}{author}")
-    mode = "каждый день новая" if data.get("mode") == "daily" else "фиксированная"
-    return "\n\n".join(lines) + f"\n\nРежим: {mode}"
-
-
-async def quotes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(_format_list(Q.load()))
-
-
-async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _allowed(update):
-        return await update.message.reply_text("⛔ Нет доступа")
-    data = Q.load()
-    try:
-        n = int(context.args[0])
-        assert 1 <= n <= len(data["quotes"])
-    except (IndexError, ValueError, AssertionError):
-        return await update.message.reply_text(f"Напиши номер от 1 до {len(data['quotes'])}, например: /quote 2")
-    data["current"], data["mode"] = n - 1, "fixed"
-    Q.save(data)
-    q = data["quotes"][n - 1]
-    await update.message.reply_text(f"✓ На экране будет:\n«{q['text']}»\nОбновится при следующем пробуждении ридера.")
-
-
-async def addquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _allowed(update):
-        return await update.message.reply_text("⛔ Нет доступа")
-    raw = update.message.text.partition(" ")[2].strip()
-    if not raw:
-        return await update.message.reply_text("Формат: /addquote Текст фразы — Автор")
-    text, author = Q.parse_new(raw)
-    data = Q.load()
-    data["quotes"].append({"text": text[:220], "author": author[:80]})
-    Q.save(data)
-    await update.message.reply_text(f"✓ Добавлено под №{len(data['quotes'])}. Поставить: /quote {len(data['quotes'])}")
-
-
-async def delquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _allowed(update):
-        return await update.message.reply_text("⛔ Нет доступа")
-    data = Q.load()
-    try:
-        n = int(context.args[0])
-        assert 1 <= n <= len(data["quotes"]) and len(data["quotes"]) > 1
-    except (IndexError, ValueError, AssertionError):
-        return await update.message.reply_text("Формат: /delquote N (последнюю фразу удалить нельзя)")
-    data["quotes"].pop(n - 1)
-    if data.get("current", 0) >= len(data["quotes"]):
-        data["current"] = 0
-    Q.save(data)
-    await update.message.reply_text("🗑 Удалено.\n\n" + _format_list(data))
-
-
-async def daily_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _allowed(update):
-        return await update.message.reply_text("⛔ Нет доступа")
-    data = Q.load()
-    data["mode"] = "daily"
-    Q.save(data)
-    await update.message.reply_text("✓ Теперь фраза меняется каждый день по списку. Вернуть одну: /quote N")
-
-
-async def screen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Рисую экран…")
-    png = await asyncio.to_thread(render_screen, "PNG")
-    await update.message.reply_photo(png, caption="Так сейчас выглядит экран сна")
-
-
 def build_telegram_app():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler("clear", clear_handler))
-    application.add_handler(CommandHandler("status", status_handler))
-    application.add_handler(CommandHandler("quotes", quotes_handler))
-    application.add_handler(CommandHandler("quote", quote_handler))
-    application.add_handler(CommandHandler("addquote", addquote_handler))
-    application.add_handler(CommandHandler("delquote", delquote_handler))
-    application.add_handler(CommandHandler("daily", daily_handler))
-    application.add_handler(CommandHandler("screen", screen_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    return application
+    app = Application.builder().token(BOT_TOKEN).build()
+    for name, fn in [("start", start_handler), ("help", help_handler), ("screen", screen_handler),
+                     ("quotes", quotes_handler), ("quote", quote_handler), ("addquote", addquote_handler),
+                     ("delquote", delquote_handler), ("daily", daily_handler), ("city", city_handler),
+                     ("instagram", instagram_handler), ("devices", devices_handler),
+                     ("newdevice", newdevice_handler), ("clear", clear_handler), ("status", status_handler)]:
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    return app
 
 
 def run_bot_in_background():
-    """Runs the Telegram bot's polling loop in its own thread with its own
-    asyncio event loop, so it doesn't block the Flask web server."""
     def _runner():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -220,45 +277,29 @@ def run_bot_in_background():
         loop.run_until_complete(application.updater.start_polling())
         loop.run_forever()
 
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
+    threading.Thread(target=_runner, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────────
-# Flask web server — serves the board state + a live display page
+# Flask
 # ─────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
 
 
-# ── Экран сна: ридер скачивает GET /sleep.bmp ─────────────────────
-_data_cache = {"at": 0.0, "data": None}
-_data_lock = threading.Lock()
+@flask_app.route("/s/<token>.<ext>")
+def device_screen(token, ext):
+    if ext not in ("bmp", "png"):
+        abort(404)
+    user = db.user_by_token(token)
+    if not user:
+        abort(404)
+    data = render_for(user, "BMP" if ext == "bmp" else "PNG")
+    return Response(data, mimetype=f"image/{ext}", headers={"Cache-Control": "no-store"})
 
 
-def render_screen(fmt="BMP") -> bytes:
-    """Погода и курсы кешируются на 30 минут, фраза берётся всегда свежая."""
-    with _data_lock:
-        if _data_cache["data"] is None or time.time() - _data_cache["at"] > 1800:
-            _data_cache["data"] = screen.collect()
-            _data_cache["at"] = time.time()
-        data = _data_cache["data"]
-    text, author = Q.today_quote()
-    img = screen.render(data, quote=text, author=author)
-    buf = io.BytesIO()
-    img.save(buf, fmt)
-    return buf.getvalue()
-
-
-@flask_app.route("/sleep.bmp")
-def sleep_bmp():
-    return Response(render_screen("BMP"), mimetype="image/bmp",
-                    headers={"Cache-Control": "no-store"})
-
-
-@flask_app.route("/sleep.png")
-def sleep_png():
-    return Response(render_screen("PNG"), mimetype="image/png",
-                    headers={"Cache-Control": "no-store"})
+@flask_app.route("/health")
+def health():
+    return jsonify(ok=True, users=db.count_users())
 
 
 @flask_app.route("/board")
@@ -358,11 +399,7 @@ def index():
     return Response(BOARD_HTML, mimetype="text/html")
 
 
-# ─────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     run_bot_in_background()
-    # give the bot a moment to initialize before Flask takes over the main thread
     time.sleep(1)
     flask_app.run(host="0.0.0.0", port=PORT)

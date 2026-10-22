@@ -35,10 +35,10 @@ def kind_from_code(c):
     return "cloud"
 
 
-def fetch_weather(monday):
+def fetch_weather(monday, lat=LAT, lon=LON):
     """Open-Meteo: Пн–Вс текущей недели (прошедшие дни тоже, через past_days)."""
     url = ("https://api.open-meteo.com/v1/forecast"
-           f"?latitude={LAT}&longitude={LON}&timezone=Asia%2FAlmaty"
+           f"?latitude={lat}&longitude={lon}&timezone=Asia%2FAlmaty"
            "&daily=weather_code,temperature_2m_max,temperature_2m_min,wind_speed_10m_max"
            "&wind_speed_unit=ms&past_days=7&forecast_days=8")
     d = json.loads(get(url))["daily"]
@@ -78,18 +78,58 @@ def money(v):  # 452.12 -> "452,12 ₸"
     return f"{v:,.2f}".replace(",", " ").replace(".", ",") + " ₸"
 
 
-def collect(demo=False):
+def week_bounds():
     today = dt.datetime.now(TZ).date()
-    monday = today - dt.timedelta(days=today.weekday())
+    return today, today - dt.timedelta(days=today.weekday())
+
+
+def weather_for(lat, lon):
+    """Погода Пн–Вс для точки; при ошибке — прочерки."""
+    _, monday = week_bounds()
+    try:
+        return fetch_weather(monday, lat, lon)
+    except Exception as e:
+        print("WARN weather:", e, file=sys.stderr)
+        return [(DAYS[k], (monday + dt.timedelta(days=k)).day, None, None, None, None) for k in range(7)]
+
+
+def market():
+    """Курсы НБ РК + BTC (общие для всех пользователей)."""
+    today, _ = week_bounds()
+    usd = eur = rub = btc = None
+    try:
+        r = fetch_rates(today)
+        usd, eur, rub = r.get("USD"), r.get("EUR"), r.get("RUB")
+    except Exception as e:
+        print("WARN rates:", e, file=sys.stderr)
+    try:
+        btc = fetch_btc()
+    except Exception as e:
+        print("WARN btc:", e, file=sys.stderr)
+    return dict(rates_date=f"{today:%d.%m}", usd=usd, eur=eur, rub=rub, btc=btc)
+
+
+def geocode(name):
+    """Название города → (lat, lon, имя по-русски) через Open-Meteo, или None."""
+    from urllib.parse import quote as q
+    data = json.loads(get(f"https://geocoding-api.open-meteo.com/v1/search?name={q(name)}&count=1&language=ru"))
+    res = (data.get("results") or [None])[0]
+    if not res:
+        return None
+    return res["latitude"], res["longitude"], res.get("name", name)
+
+
+def collect(demo=False, lat=LAT, lon=LON, city=CITY):
+    today, monday = week_bounds()
     if demo:
         wx = [("Пн", 19, "snow", 3, 0, 6), ("Вт", 20, "part", 4, 1, 7), ("Ср", 21, "cloud", 8, 2, 8),
               ("Чт", 22, "rain", 5, -2, 7), ("Пт", 23, "part", 0, -6, 5), ("Сб", 24, "sun", 2, -6, 4),
               ("Вс", 25, "part", 5, -4, 3)]
-        return dict(today=dt.date(2026, 10, 22), monday=dt.date(2026, 10, 19), wx=wx,
+        return dict(today=dt.date(2026, 10, 22), monday=dt.date(2026, 10, 19), wx=wx, city=city,
                     rates_date="22.10", usd=452.12, eur=508.95, rub=5.41, btc=82771)
     errors = []
     try:
-        wx = fetch_weather(monday)
+        wx = fetch_weather(monday, lat, lon)
     except Exception as e:
         errors.append(f"weather: {e}")
         wx = [(DAYS[k], (monday + dt.timedelta(days=k)).day, None, None, None, None) for k in range(7)]
@@ -106,7 +146,7 @@ def collect(demo=False):
         btc = None
     for e in errors:
         print("WARN", e, file=sys.stderr)
-    return dict(today=today, monday=monday, wx=wx, rates_date=f"{today:%d.%m}",
+    return dict(today=today, monday=monday, wx=wx, city=city, rates_date=f"{today:%d.%m}",
                 usd=usd, eur=eur, rub=rub, btc=btc)
 
 
@@ -127,7 +167,7 @@ SERIF_I, SANS, SANS_B = "DejaVuSerif-Italic.ttf", "DejaVuSans.ttf", "DejaVuSans-
 K, G1, GRAY, WH = 0, 85, 140, 255  # на этом e-ink светлее ~150 почти пропадает
 
 
-def render(data, quote=QUOTE, author=AUTHOR, out=None):
+def render(data, quote=QUOTE, author=AUTHOR, instagram=INSTAGRAM, out=None):
     """Рисует экран. Возвращает PIL.Image; если out задан — сохраняет out.bmp и out_preview.png."""
     img = Image.new("L", (W, H), WH)
     d = ImageDraw.Draw(img)
@@ -200,7 +240,7 @@ def render(data, quote=QUOTE, author=AUTHOR, out=None):
     y += len(weeks) * ch + 22
 
     # 3. погода
-    section(y, f"Погода · {CITY}")
+    section(y, f"Погода · {data.get('city', CITY)}")
     y += 26
 
     def sun(cx, cy, r):
@@ -272,8 +312,11 @@ def render(data, quote=QUOTE, author=AUTHOR, out=None):
     # 5. низ
     d.line([(M, H - 44), (W - M, H - 44)], fill=K, width=2)
     fs, fb = F(SANS_B, 15), F(SANS_B, 18)
-    d.text((M, H - 31), "для связи · Instagram", font=fs, fill=K)
-    d.text((W - M - tl(INSTAGRAM, fb), H - 33), INSTAGRAM, font=fb, fill=K)
+    if instagram:
+        d.text((M, H - 31), "для связи · Instagram", font=fs, fill=K)
+        d.text((W - M - tl(instagram, fb), H - 33), instagram, font=fb, fill=K)
+    else:
+        d.text((M, H - 31), "Noxen Frame", font=fs, fill=K)
 
     if out:
         img.save(out + ".bmp")
