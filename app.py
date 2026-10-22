@@ -17,6 +17,7 @@ Once this is proven, the next step is: real device via HTTP instead
 of this HTML page, and a proper database instead of a global variable.
 """
 
+import io
 import os
 import json
 import threading
@@ -25,6 +26,9 @@ import time
 from datetime import datetime
 
 from flask import Flask, jsonify, Response
+
+import quotes as Q
+import screen
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -73,9 +77,16 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я Noxen Bot 🖤\n\n"
         "Напиши мне что угодно — сообщение появится на виртуальном табло.\n\n"
-        "Команды:\n"
+        "Команды табло:\n"
         "/clear — очистить табло\n"
-        "/status — текущее состояние табло"
+        "/status — текущее состояние табло\n\n"
+        "Экран сна ридера:\n"
+        "/quotes — список фраз\n"
+        "/quote N — поставить фразу №N\n"
+        "/addquote Текст — Автор — добавить свою\n"
+        "/delquote N — удалить фразу №N\n"
+        "/daily — менять фразу каждый день\n"
+        "/screen — показать, как выглядит экран сейчас"
     )
 
 
@@ -101,11 +112,98 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✓ Отправлено на табло:\n«{text}»")
 
 
+# ── Фразы для экрана сна ──────────────────────────────────────────
+OWNER_ID = os.environ.get("OWNER_ID")  # если задан — менять фразы может только владелец
+
+
+def _allowed(update: Update) -> bool:
+    return not OWNER_ID or str(update.effective_user.id) == OWNER_ID
+
+
+def _format_list(data):
+    lines = []
+    for i, q in enumerate(data["quotes"], 1):
+        mark = "▶️" if data.get("mode") != "daily" and i - 1 == data.get("current", 0) else f"{i}."
+        author = f" — {q['author']}" if q.get("author") else ""
+        lines.append(f"{mark} {q['text']}{author}")
+    mode = "каждый день новая" if data.get("mode") == "daily" else "фиксированная"
+    return "\n\n".join(lines) + f"\n\nРежим: {mode}"
+
+
+async def quotes_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(_format_list(Q.load()))
+
+
+async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return await update.message.reply_text("⛔ Нет доступа")
+    data = Q.load()
+    try:
+        n = int(context.args[0])
+        assert 1 <= n <= len(data["quotes"])
+    except (IndexError, ValueError, AssertionError):
+        return await update.message.reply_text(f"Напиши номер от 1 до {len(data['quotes'])}, например: /quote 2")
+    data["current"], data["mode"] = n - 1, "fixed"
+    Q.save(data)
+    q = data["quotes"][n - 1]
+    await update.message.reply_text(f"✓ На экране будет:\n«{q['text']}»\nОбновится при следующем пробуждении ридера.")
+
+
+async def addquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return await update.message.reply_text("⛔ Нет доступа")
+    raw = update.message.text.partition(" ")[2].strip()
+    if not raw:
+        return await update.message.reply_text("Формат: /addquote Текст фразы — Автор")
+    text, author = Q.parse_new(raw)
+    data = Q.load()
+    data["quotes"].append({"text": text[:220], "author": author[:80]})
+    Q.save(data)
+    await update.message.reply_text(f"✓ Добавлено под №{len(data['quotes'])}. Поставить: /quote {len(data['quotes'])}")
+
+
+async def delquote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return await update.message.reply_text("⛔ Нет доступа")
+    data = Q.load()
+    try:
+        n = int(context.args[0])
+        assert 1 <= n <= len(data["quotes"]) and len(data["quotes"]) > 1
+    except (IndexError, ValueError, AssertionError):
+        return await update.message.reply_text("Формат: /delquote N (последнюю фразу удалить нельзя)")
+    data["quotes"].pop(n - 1)
+    if data.get("current", 0) >= len(data["quotes"]):
+        data["current"] = 0
+    Q.save(data)
+    await update.message.reply_text("🗑 Удалено.\n\n" + _format_list(data))
+
+
+async def daily_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _allowed(update):
+        return await update.message.reply_text("⛔ Нет доступа")
+    data = Q.load()
+    data["mode"] = "daily"
+    Q.save(data)
+    await update.message.reply_text("✓ Теперь фраза меняется каждый день по списку. Вернуть одну: /quote N")
+
+
+async def screen_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Рисую экран…")
+    png = await asyncio.to_thread(render_screen, "PNG")
+    await update.message.reply_photo(png, caption="Так сейчас выглядит экран сна")
+
+
 def build_telegram_app():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("clear", clear_handler))
     application.add_handler(CommandHandler("status", status_handler))
+    application.add_handler(CommandHandler("quotes", quotes_handler))
+    application.add_handler(CommandHandler("quote", quote_handler))
+    application.add_handler(CommandHandler("addquote", addquote_handler))
+    application.add_handler(CommandHandler("delquote", delquote_handler))
+    application.add_handler(CommandHandler("daily", daily_handler))
+    application.add_handler(CommandHandler("screen", screen_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     return application
 
@@ -130,6 +228,37 @@ def run_bot_in_background():
 # Flask web server — serves the board state + a live display page
 # ─────────────────────────────────────────────────────────────────
 flask_app = Flask(__name__)
+
+
+# ── Экран сна: ридер скачивает GET /sleep.bmp ─────────────────────
+_data_cache = {"at": 0.0, "data": None}
+_data_lock = threading.Lock()
+
+
+def render_screen(fmt="BMP") -> bytes:
+    """Погода и курсы кешируются на 30 минут, фраза берётся всегда свежая."""
+    with _data_lock:
+        if _data_cache["data"] is None or time.time() - _data_cache["at"] > 1800:
+            _data_cache["data"] = screen.collect()
+            _data_cache["at"] = time.time()
+        data = _data_cache["data"]
+    text, author = Q.today_quote()
+    img = screen.render(data, quote=text, author=author)
+    buf = io.BytesIO()
+    img.save(buf, fmt)
+    return buf.getvalue()
+
+
+@flask_app.route("/sleep.bmp")
+def sleep_bmp():
+    return Response(render_screen("BMP"), mimetype="image/bmp",
+                    headers={"Cache-Control": "no-store"})
+
+
+@flask_app.route("/sleep.png")
+def sleep_png():
+    return Response(render_screen("PNG"), mimetype="image/png",
+                    headers={"Cache-Control": "no-store"})
 
 
 @flask_app.route("/board")
