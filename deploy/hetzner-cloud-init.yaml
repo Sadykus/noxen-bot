@@ -1,0 +1,19 @@
+#cloud-config
+# Вставьте это целиком в поле «Cloud config» при создании сервера в Hetzner.
+# Замените ВСТАВЬТЕ_ТОКЕН на новый токен от @BotFather (одна строка, без кавычек).
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - git
+write_files:
+  - path: /root/bot_token
+    permissions: "0600"
+    content: |
+      ВСТАВЬТЕ_ТОКЕН
+runcmd:
+  - systemctl enable --now docker
+  - git clone https://github.com/Sadykus/noxen-bot /opt/noxen
+  - IP=$(curl -s http://169.254.169.254/hetzner/v1/metadata/public-ipv4); printf "BOT_TOKEN=%s\nPUBLIC_URL=http://%s\n" "$(tr -d ' \r\n' < /root/bot_token)" "$IP" > /opt/noxen/.env; chmod 600 /opt/noxen/.env
+  - cd /opt/noxen && docker compose up -d --build
+  - echo "*/10 * * * * root /opt/noxen/deploy/update.sh >> /var/log/noxen-update.log 2>&1" > /etc/cron.d/noxen-update
